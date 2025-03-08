@@ -53,7 +53,6 @@ In order to connect Open WebUI to it, simply go to "Connections" in the settings
 
 Sometimes, but rarely, when you start the server you will get a GIL issue when you try to generate a response. Just restart the server and it will most likely work the next time you run it, and keep working from then on.
 
-There is a slight performance penalty on the TPS when running a model through this server as opposed to running the chat_full.py file in the terminal directly. I am looking into this.
 
 ## One last thing
 

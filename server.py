@@ -180,16 +180,46 @@ class StreamingTokenGenerator:
             logger.info(f"Starting token generation from position {pos}")
             
             while not self.stop_event.is_set():
+                # Check if we need to shift window (similar to chat_full.py)
+                if pos >= self.context_length - 2:
+                    # Calculate shift to maintain full batches
+                    batch_size = self.batch_size
+                    # Calculate max batches that fit in context
+                    max_batches = self.context_length // batch_size
+                    desired_batches = max(1, max_batches - 2)  # Leave room for new tokens
+                    new_size = min(desired_batches * batch_size, self.context_length - batch_size)
+                    
+                    # Create shifted input_ids
+                    tmp = torch.zeros((1, self.context_length), dtype=torch.int32)
+                    tmp[:,0:new_size] = input_ids[:,pos-new_size:pos]
+                    input_ids = tmp
+                    
+                    # Run prefill on the shifted window
+                    run_prefill(
+                        self.embed_model,
+                        self.ffn_models,
+                        input_ids,
+                        new_size,  # Prefill the entire shifted content
+                        self.context_length,
+                        self.batch_size,
+                        state_copy,
+                        self.causal_mask
+                    )
+                    
+                    # Start generating from the next position
+                    pos = new_size
+                    logger.info(f"Window shifted, continuing from position {pos}")
+                
                 # Make sure input_ids has the right shape [1, seq_len]
                 if len(input_ids.shape) != 2 or input_ids.shape[0] != 1:
-                    logger.info(f"Reshaping input_ids from {input_ids.shape} to [1, seq_len]")
                     input_ids = input_ids.view(1, -1)
                 
+                # Generate next token with minimal overhead
                 next_token_id = generate_next_token(
                     self.embed_model,
                     self.ffn_models,
                     self.lmhead_model,
-                    input_ids,  # Already a tensor with shape [1, seq_len]
+                    input_ids,
                     pos,
                     self.context_length,
                     state_copy,
@@ -200,19 +230,19 @@ class StreamingTokenGenerator:
                 # Check for EOS token
                 if next_token_id == self.tokenizer.eos_token_id:
                     logger.info(f"EOS token detected (ID: {next_token_id})")
-                    self.stop_event.set()  # Set the stop event to signal completion
+                    self.stop_event.set()
                     with self.queue_lock:
                         self.token_queue.put(None)  # Signal end of generation
                     break
                 
-                # Decode the token
+                # Update input_ids for next iteration
+                input_ids[0, pos] = next_token_id
+                
+                # Decode and queue the token with minimal locking
                 token_text = self.tokenizer.decode([next_token_id])
                 with self.queue_lock:
                     self.token_queue.put(token_text)
                 
-                # Update for next iteration - directly assign the new token to the tensor
-                # This matches the original implementation in chat_full.py
-                input_ids[0, pos] = next_token_id
                 generated_ids.append(next_token_id)
                 pos += 1
                 
@@ -226,11 +256,14 @@ class StreamingTokenGenerator:
     def get_tokens(self):
         """Get the next token from the queue."""
         try:
-            # Use a lock to ensure thread safety when accessing the queue
-            with self.queue_lock:
-                # Use a shorter timeout to avoid GIL issues
-                token = self.token_queue.get(timeout=0.05)
-            return token  # This could be None, a string token, or an error dict
+            # Use a non-blocking approach to reduce GIL contention
+            try:
+                # First try without lock and without waiting
+                return self.token_queue.get_nowait()
+            except queue.Empty:
+                # If empty, use a very short timeout with lock
+                with self.queue_lock:
+                    return self.token_queue.get(timeout=0.01)
         except queue.Empty:
             return None
 
@@ -239,20 +272,22 @@ class StreamingTokenGenerator:
         # Set the stop event to signal the generation thread to stop
         self.stop_event.set()
         
-        # Clear the queue to prevent blocking
+        # Clear the queue without locking if possible
         try:
-            with self.queue_lock:  # Use the lock when clearing the queue
-                while not self.token_queue.empty():
+            while not self.token_queue.empty():
+                try:
                     self.token_queue.get_nowait()
+                except queue.Empty:
+                    break
         except Exception:
             pass
             
-        # Join the thread with a timeout
+        # Join the thread with a short timeout to avoid blocking
         if self.generation_thread and self.generation_thread.is_alive():
             try:
-                self.generation_thread.join(timeout=1)
-            except Exception as e:
-                logger.error(f"Error joining generation thread: {str(e)}")
+                self.generation_thread.join(timeout=0.1)
+            except Exception:
+                pass
 
 
 async def stream_chat_completion(request: ChatCompletionRequest):
@@ -281,15 +316,26 @@ async def stream_chat_completion(request: ChatCompletionRequest):
         
         content_so_far = ""
         
+        # Use a more efficient polling approach
+        consecutive_empty_polls = 0
+        max_empty_polls = 5
+        
         while True:
-            token = await asyncio.get_event_loop().run_in_executor(None, generator.get_tokens)
+            # Get token with minimal executor overhead
+            token = generator.get_tokens()  # Direct call instead of using run_in_executor
             
             # Check if token is None (end of generation or timeout)
             if token is None:
                 # Check if we're just waiting for more tokens or if the EOS token was detected
                 if not generator.stop_event.is_set():
-                    # Just a timeout, continue waiting
-                    await asyncio.sleep(0.1)  # Add a small delay to prevent CPU spinning
+                    consecutive_empty_polls += 1
+                    if consecutive_empty_polls >= max_empty_polls:
+                        # After several empty polls, use a longer sleep to reduce CPU usage
+                        await asyncio.sleep(0.05)
+                        consecutive_empty_polls = 0
+                    else:
+                        # Short sleep for quick response
+                        await asyncio.sleep(0.01)
                     continue
                 
                 # End of generation (EOS token was detected or generation was stopped)
@@ -297,6 +343,9 @@ async def stream_chat_completion(request: ChatCompletionRequest):
                 yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': request.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
                 yield "data: [DONE]\n\n"
                 break
+            
+            # Reset counter since we got a token
+            consecutive_empty_polls = 0
             
             # Check if token is an error message
             if isinstance(token, dict) and "error" in token:
@@ -309,16 +358,9 @@ async def stream_chat_completion(request: ChatCompletionRequest):
             
             # Send the token
             yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': request.model, 'choices': [{'index': 0, 'delta': {'content': token}, 'finish_reason': None}]})}\n\n"
-    except Exception as e:
-        logger.error(f"Error in streaming: {str(e)}")
-        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created_time, 'model': request.model, 'choices': [{'index': 0, 'delta': {'content': f'Error: {str(e)}'}, 'finish_reason': 'error'}]})}\n\n"
-        yield "data: [DONE]\n\n"
     finally:
-        try:
-            # Make sure to stop the generator in a way that doesn't block
-            await asyncio.get_event_loop().run_in_executor(None, generator.stop)
-        except Exception as e:
-            logger.error(f"Error stopping generator: {str(e)}")
+        # Ensure generator is stopped even if an exception occurs
+        generator.stop()
 
 async def generate_chat_completion(request: ChatCompletionRequest):
     """Generate non-streaming chat completion response."""
