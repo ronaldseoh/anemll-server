@@ -124,7 +124,12 @@ curl http://localhost:8000/v1/models
 ```
 
 
+## Links
+
+Unofficial Discord server for Anemll:
+
+https://discord.gg/xgtQDDBGcM
+
 ## License
 
 MIT - Do whatever you want with this.
-
