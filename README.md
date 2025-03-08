@@ -53,6 +53,8 @@ In order to connect Open WebUI to it, simply go to "Connections" in the settings
 
 Sometimes, but rarely, when you start the server you will get a GIL issue when you try to generate a response. Just restart the server and it will most likely work the next time you run it, and keep working from then on.
 
+There is a slight performance penalty on the TPS when running a model through this server as opposed to running the chat_full.py file in the terminal directly. I am looking into this.
+
 ## One last thing
 
 Anemll is still in its early stages, with a limited amount of models on Hugging Face and development of the core library still ongoing. This presents a unique opportunity to become an early contributor to this emerging technology. Whether you're interested in experimenting with the library, converting models, contributing code, or simply raising awareness - your involvement can help shape the future of on-device AI acceleration. The ANE represents a significant advancement in efficient ML inference, and community participation is vital to realizing its full potential.
