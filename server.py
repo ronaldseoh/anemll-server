@@ -42,6 +42,9 @@ logger = logging.getLogger(__name__)
 # Hardcoded model directory path
 MODEL_DIR = "/example-path/anemll-Meta-Llama-3.2-1B-ctx2048_0.1.2"
 
+# Global flag to control truncation
+ALLOW_TRUNCATION = False
+
 app = FastAPI(title="Anemll API Server")
 
 # Add CORS middleware
@@ -127,6 +130,33 @@ class StreamingTokenGenerator:
                 return_tensors="pt",
                 add_generation_prompt=True
             ).to(torch.int32)
+            
+            # Check if the input exceeds context length
+            if base_input_ids.size(1) > self.context_length:
+                if ALLOW_TRUNCATION:
+                    logger.warning(f"Input length ({base_input_ids.size(1)}) exceeds context length ({self.context_length}). Truncating input.")
+                    # Take the last context_length tokens to maintain the most recent context
+                    base_input_ids = base_input_ids[:, -self.context_length:]
+                else:
+                    error_message = f"""
+=============================================================================
+ERROR: INPUT EXCEEDS MODEL CONTEXT LENGTH
+=============================================================================
+Input length: {base_input_ids.size(1)} tokens
+Model context length: {self.context_length} tokens
+
+Anemll models have a strict context limit, which is specified at conversion time and entered into the name as the ctx value.
+
+To automatically truncate inputs to fit the model context window, restart the 
+server with the --truncate flag:
+
+    python server.py --truncate
+=============================================================================
+"""
+                    logger.error(error_message)
+                    with self.queue_lock:
+                        self.token_queue.put({"error": "Input exceeds model context length. Use --truncate to enable automatic truncation."})
+                    return
             
             # Convert to tensor with batch dimension
             input_ids = base_input_ids
@@ -572,13 +602,23 @@ def load_model_components():
 
 def main():
     """Main function to start the server."""
+    global ALLOW_TRUNCATION
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Anemll API Server")
+    parser.add_argument("--truncate", action="store_true", help="Enable automatic truncation of inputs that exceed model context length")
+    args = parser.parse_args()
+    
+    # Set global flags
+    ALLOW_TRUNCATION = args.truncate
+    
     # Load model components
     load_model_components()
     
     # Start the server
     host = "0.0.0.0"
     port = 8000
-    logger.info(f"Starting server on {host}:{port}")
+    logger.info(f"Starting server on {host}:{port} (Truncation: {'Enabled' if ALLOW_TRUNCATION else 'Disabled'})")
     uvicorn.run(app, host=host, port=port)
 
 if __name__ == "__main__":
