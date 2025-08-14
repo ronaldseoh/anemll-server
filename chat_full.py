@@ -30,6 +30,7 @@ RESET_COLOR = "\033[0m"
 WARMUP_TOKEN_LIMIT = 10  # Maximum tokens to generate during warmup
 THINKING_MODE = False
 THINKING_PROMPT = """You are a deep thinking AI, you may use extremely long chains of thought to deeply consider the problem and deliberate with yourself via systematic reasoning processes to help come to a correct solution prior to answering. You should enclose your thoughts and internal monologue inside <think> </think> tags, and then provide your solution or response to the problem."""
+DEBUG_LEVEL = 0  # Default debug level
 
 class TokenPrinter:
     """Handles background printing of generated tokens."""
@@ -139,6 +140,30 @@ def parse_model_path(path):
         if candidate.exists():
             print(f"Found model at: {candidate}")
             return str(candidate)
+    
+    # If embeddings with LUT suffix not found, try without LUT suffix
+    if "_lut" in str(path) and "embeddings" in str(path):
+        print(f"Failed to find {path}, trying without LUT suffix...")
+        # Remove LUT suffix
+        path_no_lut = str(path).split("_lut")[0]
+        path_no_lut = Path(path_no_lut)
+        
+        # Try candidates without LUT suffix
+        candidates_no_lut = [
+            path_no_lut,
+            path_no_lut.with_suffix('.mlmodelc'),
+            path_no_lut.with_suffix('.mlpackage'),
+            Path(str(path_no_lut) + '.mlmodelc'),
+            Path(str(path_no_lut) + '.mlpackage')
+        ]
+        
+        for candidate in candidates_no_lut:
+            if candidate.exists():
+                print(f"Found model at: {candidate}")
+                return str(candidate)
+        
+        # Add no-LUT candidates to the list for error reporting
+        candidates.extend(candidates_no_lut)
             
     # If we get here, no valid path was found
     print("\nError: Model not found. Tried following paths:")
@@ -219,6 +244,10 @@ def parse_args():
     parser.add_argument('--nw', action='store_true',
                        help='Skip warmup phase')
     
+    # Add debug level
+    parser.add_argument('--debug-level', type=int, default=0,
+                       help='Debug level (0=none, 1=print prompts, 2=more verbose)')
+    
     # Model configuration
     parser.add_argument('--context-length', type=int,
                        help='Context length for the model (default: 512), if not provided, it will be detected from the model directory name ctxNUMBER')
@@ -242,13 +271,14 @@ def parse_args():
             prefix = params.get('model_prefix', 'llama')  # Default to 'llama' if not specified
             lut_ffn = f"_lut{params['lut_ffn']}" if params['lut_ffn'] != 'none' else ''
             lut_lmhead = f"_lut{params['lut_lmhead']}" if params['lut_lmhead'] != 'none' else ''
+            lut_embeddings = f"_lut{params['lut_embeddings']}" if params['lut_embeddings'] != 'none' else ''
             num_chunks = int(params['num_chunks'])
             
             # Set model paths if not specified
-            if not args.embed:
-                args.embed = f'{prefix}_embeddings'
             if not args.lmhead:
                 args.lmhead = f'{prefix}_lm_head{lut_lmhead}'
+            if not args.embed:
+                args.embed = f'{prefix}_embeddings{lut_embeddings}'  # Changed from lm_head to embeddings
             if not args.ffn:
                 args.ffn = f'{prefix}_FFN_PF{lut_ffn}_chunk_01of{num_chunks:02d}'
             if not args.tokenizer:
@@ -261,10 +291,17 @@ def parse_args():
                 args.batch_size = int(params['batch_size'])
             args.num_chunks = num_chunks
             
+            # Parse split_lm_head parameter from meta.yaml
+            if 'split_lm_head' in params:
+                args.split_lm_head = int(params['split_lm_head'])
+            else:
+                args.split_lm_head = 8  # Default value
+            
             print(f"\nLoaded parameters from {args.meta}:")
             print(f"  Context Length: {args.context_length}")
             print(f"  Batch Size: {args.batch_size}")
             print(f"  Num Chunks: {args.num_chunks}")
+            print(f"  Split LM Head: {args.split_lm_head}")
             print(f"  Models Directory: {args.d}")
             print(f"  Embeddings: {args.embed}")
             print(f"  LM Head: {args.lmhead}")
@@ -307,12 +344,24 @@ def load_metadata(model,args):
         print("\nModel Shapes:")
         if hasattr(model, 'input_description'):
             print("  Inputs:")
-            for name, desc in model.input_description.items():
-                print(f"    {name}: {desc}")
+            try:
+                if hasattr(model.input_description, 'items'):
+                    for name, desc in model.input_description.items():
+                        print(f"    {name}: {desc}")
+                else:
+                    print(f"    {model.input_description}")
+            except:
+                print(f"    Input description: {type(model.input_description)}")
         if hasattr(model, 'output_description'):
             print("  Outputs:")
-            for name, desc in model.output_description.items():
-                print(f"    {name}: {desc}")
+            try:
+                if hasattr(model.output_description, 'items'):
+                    for name, desc in model.output_description.items():
+                        print(f"    {name}: {desc}")
+                else:
+                    print(f"    {model.output_description}")
+            except:
+                print(f"    Output description: {type(model.output_description)}")
     else:
         print("\nWarning: No metadata found in model")
 
@@ -523,7 +572,7 @@ def run_prefill(embed_model, ffn_models, input_ids, current_pos, context_length,
     
     return torch.tensor([current_pos], dtype=torch.int32)
 
-def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state, causal_mask, temperature=0.0):
+def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, context_length, state, causal_mask, metadata=None, temperature=0.0):
     """Generate the next token."""
     # Get current token
     current_token = input_ids[:, pos-1:pos]
@@ -559,7 +608,7 @@ def generate_next_token(embed_model, ffn_models, lmhead_model, input_ids, pos, c
     
     if 'logits1' in lm_output:
         logits_parts = []
-        for i in range(1, 9):
+        for i in range(1, metadata.get('split_lm_head', 8) + 1):
             key = f'logits{i}'
             if key in lm_output:
                 logits_parts.append(torch.from_numpy(lm_output[key]))
@@ -658,6 +707,7 @@ def get_user_input():
 def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state, causal_mask, auto_prompt=None, warmup=False):
     """Interactive chat loop."""
     global THINKING_MODE
+    global DEBUG_LEVEL
     context_length = metadata.get('context_length')
     batch_size = metadata.get('batch_size', 64)
     
@@ -707,12 +757,22 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     return_tensors="pt",
                     add_generation_prompt=True
                 ).to(torch.int32)
+                
+                # Print full prompt if debug level >= 1
+                if DEBUG_LEVEL >= 1 and not warmup:
+                    print(f"\n{DARK_BLUE}Debug: Full prompt with thinking:{RESET_COLOR}")
+                    print(tokenizer.decode(base_input_ids[0]))
             else:
                 base_input_ids = tokenizer.apply_chat_template(
                     conversation,
                     return_tensors="pt",
                     add_generation_prompt=True
                 ).to(torch.int32)
+                
+                # Print full prompt if debug level >= 1
+                if DEBUG_LEVEL >= 1 and not warmup:
+                    print(f"\n{DARK_BLUE}Debug: Full prompt:{RESET_COLOR}")
+                    print(tokenizer.decode(base_input_ids[0]))
             
             # Check if we need to trim history
             while base_input_ids.size(1) > context_length - 100:  # Leave room for response
@@ -740,6 +800,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
             
             if not warmup:
                 print(f"\n{LIGHT_BLUE}Assistant:{RESET_COLOR}", end=' ', flush=True)
+            
+            # split_lm_head should already be in metadata from caller
             
             # Initialize token printer and collect response
             token_printer = TokenPrinter(tokenizer)
@@ -811,7 +873,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                         pos,
                         context_length,
                         state,
-                        causal_mask
+                        causal_mask,
+                        metadata
                     )
                     
                     # Add token
@@ -828,8 +891,14 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
                     if warmup and tokens_generated >= WARMUP_TOKEN_LIMIT:
                         break
                     
-                    if next_token == tokenizer.eos_token_id:
-                        break
+                    # Check for all possible EOS tokens
+                    eos_token_ids = tokenizer.eos_token_id
+                    if isinstance(eos_token_ids, list):
+                        if next_token in eos_token_ids:
+                            break
+                    else:
+                        if next_token == eos_token_ids:
+                            break
                 
                 inference_time = time.time() - inference_start  # Calculate inference time
                 
@@ -865,6 +934,8 @@ def chat_loop(embed_model, ffn_models, lmhead_model, tokenizer, metadata, state,
 
 def main():
     args = parse_args()
+    global DEBUG_LEVEL
+    DEBUG_LEVEL = args.debug_level
     
     # Convert directory to absolute path
     model_dir = Path(args.d).resolve()
@@ -916,6 +987,9 @@ def main():
         
         # Initialize causal mask once
         causal_mask = initialize_causal_mask(metadata['context_length'])
+        
+        # Add split_lm_head to metadata for generate_next_token
+        metadata['split_lm_head'] = getattr(args, 'split_lm_head', 8)
         
         # Warmup runs to prevent Python GIL issues with CoreML !
         if not args.nw:
