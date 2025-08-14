@@ -251,6 +251,7 @@ server with the --truncate flag:
                     self.context_length,
                     state_copy,
                     self.causal_mask,
+                    metadata=metadata,
                     temperature=self.temperature
                 )
                 
