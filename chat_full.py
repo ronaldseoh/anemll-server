@@ -451,6 +451,8 @@ def load_models(args,metadata):
                 except Exception as e:
                     print(f"Error loading chunk {chunk_path}: {str(e)}")
                     raise
+
+            args.num_chunks = len(chunk_paths)                    
             metadata = load_metadata(ffn_models[0],args)
 
         else:
