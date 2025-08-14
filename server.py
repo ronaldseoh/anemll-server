@@ -600,6 +600,7 @@ def load_model_components():
 def main():
     """Main function to start the server."""
     global ALLOW_TRUNCATION
+    global MODEL_DIR
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Anemll API Server")
