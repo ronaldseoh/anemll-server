@@ -39,9 +39,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Hardcoded model directory path
-MODEL_DIR = "/example-path/anemll-Meta-Llama-3.2-1B-ctx2048_0.1.2"
-
 # Global flag to control truncation
 ALLOW_TRUNCATION = False
 
@@ -607,10 +604,12 @@ def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Anemll API Server")
     parser.add_argument("--truncate", action="store_true", help="Enable automatic truncation of inputs that exceed model context length")
+    parser.add_argument("--model-dir")
     args = parser.parse_args()
     
     # Set global flags
     ALLOW_TRUNCATION = args.truncate
+    MODEL_DIR = args.model_dir
     
     # Load model components
     load_model_components()
